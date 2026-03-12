@@ -27,3 +27,9 @@ variable "app_image" {
   type = string
   default = "731945947682.dkr.ecr.us-east-1.amazonaws.com/dnd-forum:latest"
 }
+
+variable "subdomain" {
+  description = "url of the full subdomain"
+  type = string
+  default = "forum.thegradyproject.com"
+}

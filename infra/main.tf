@@ -2,19 +2,6 @@ provider "aws" {
   region = var.aws_region
 }
 
-# -------------------------------------------------------
-# VARIABLES (add these to your variables.tf)
-# -------------------------------------------------------
-# var.aws_region
-# var.vpc_id
-# var.route53_zone_id
-# var.cluster_name
-# var.app_image          - your ECR image URI
-# var.db_host            - RDS endpoint (from statics)
-# var.db_name
-# var.db_user
-# var.db_password        - use SSM or Secrets Manager in prod
-
 locals {
   subnet_ids = [
     "subnet-048916d83b3d6dcf1",
@@ -23,9 +10,7 @@ locals {
   ]
 }
 
-# -------------------------------------------------------
 # ECS CLUSTER
-# -------------------------------------------------------
 resource "aws_ecs_cluster" "phpbb" {
   name = var.cluster_name
 
@@ -35,11 +20,7 @@ resource "aws_ecs_cluster" "phpbb" {
   }
 }
 
-# -------------------------------------------------------
-# EFS - replaces Mountpoint S3 FUSE mount
-# Fargate mounts this at /mnt/phpbb-s3, entrypoint.sh
-# symlinks are unchanged.
-# -------------------------------------------------------
+# EFS 
 resource "aws_efs_file_system" "phpbb" {
   creation_token = "phpbb-efs"
   encrypted      = true
@@ -76,9 +57,7 @@ resource "aws_efs_access_point" "phpbb" {
   }
 }
 
-# -------------------------------------------------------
 # SECURITY GROUPS
-# -------------------------------------------------------
 resource "aws_security_group" "alb" {
   name        = "phpbb-alb-sg"
   description = "Allow HTTP/HTTPS inbound to ALB"
@@ -146,9 +125,7 @@ resource "aws_security_group" "efs" {
   }
 }
 
-# -------------------------------------------------------
 # ALB
-# -------------------------------------------------------
 resource "aws_lb" "phpbb" {
   name               = "phpbb-alb"
   internal           = false
@@ -188,12 +165,18 @@ resource "aws_lb_listener" "http" {
   }
 }
 
+data "terraform_remote_state" "statics" { # importing outputs from other folder
+  backend = "local"
+  config = {
+    path = "../statics/terraform.tfstate"
+  }
+}
 resource "aws_lb_listener" "https" {
   load_balancer_arn = aws_lb.phpbb.arn
   port              = 443
   protocol          = "HTTPS"
   ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-  certificate_arn   = var.acm_cert_arn # pass in from statics output
+  certificate_arn = data.terraform_remote_state.statics.outputs.aws_acm_certificate # pass in from statics output
 
   default_action {
     type             = "forward"
@@ -201,10 +184,8 @@ resource "aws_lb_listener" "https" {
   }
 }
 
-# -------------------------------------------------------
 # IAM - ECS TASK EXECUTION ROLE
 # (pulls image from ECR, writes logs to CloudWatch)
-# -------------------------------------------------------
 resource "aws_iam_role" "ecs_execution" {
   name = "phpbb-ecs-execution-role"
 
@@ -223,11 +204,7 @@ resource "aws_iam_role_policy_attachment" "ecs_execution_managed" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# -------------------------------------------------------
 # IAM - ECS TASK ROLE
-# (what the running container is allowed to do)
-# Replaces IRSA phpbb_irsa - same S3 permissions, no OIDC needed
-# -------------------------------------------------------
 resource "aws_iam_role" "ecs_task" {
   name = "phpbb-ecs-task-role"
 
@@ -276,10 +253,7 @@ resource "aws_iam_role_policy_attachment" "phpbb_s3_attach" {
   policy_arn = aws_iam_policy.phpbb_s3_policy.arn
 }
 
-# -------------------------------------------------------
 # IAM - EXTERNAL DNS ROLE
-# Replaces IRSA externaldns - same Route53 permissions
-# -------------------------------------------------------
 resource "aws_iam_role" "externaldns" {
   name = "external-dns"
 
@@ -317,17 +291,13 @@ resource "aws_iam_role_policy_attachment" "externaldns" {
   policy_arn = aws_iam_policy.externaldns.arn
 }
 
-# -------------------------------------------------------
 # CLOUDWATCH LOG GROUP
-# -------------------------------------------------------
 resource "aws_cloudwatch_log_group" "phpbb" {
   name              = "/ecs/phpbb"
   retention_in_days = 7
 }
 
-# -------------------------------------------------------
-# SECRET DATABASE HOOKUP
-# -------------------------------------------------------
+# SECRET FOR DATABASE CONNECT
 
 data "aws_secretsmanager_secret" "phpbb_config" {
   name = "phpbb/config"
@@ -353,12 +323,14 @@ resource "aws_iam_role_policy_attachment" "secrets_attach" {
 
 
 
-# -------------------------------------------------------
+
 # ECS TASK DEFINITION
-# t3.medium was 2 vCPU / 4GB - 512 CPU / 1024 MB is
-# plenty for 7 concurrent users on phpBB. Adjust up if
-# needed - Fargate billing is per vCPU/memory second.
-# -------------------------------------------------------
+
+resource "aws_iam_role_policy_attachment" "ecs_task_ssm" {
+  role       = aws_iam_role.ecs_task.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
 resource "aws_ecs_task_definition" "phpbb" {
   family                   = "phpbb"
   requires_compatibilities = ["FARGATE"]
@@ -390,7 +362,7 @@ resource "aws_ecs_task_definition" "phpbb" {
         { containerPort = 80, protocol = "tcp" }
       ]
 
-      # EFS mounted at /mnt/phpbb-s3 - entrypoint.sh symlinks are unchanged
+      # EFS mounted at /mnt/phpbb-s3 
       mountPoints = [
         {
           sourceVolume  = "phpbb-efs"
@@ -416,14 +388,15 @@ resource "aws_ecs_task_definition" "phpbb" {
   ])
 }
 
-# -------------------------------------------------------
+
 # ECS SERVICE
-# -------------------------------------------------------
+
 resource "aws_ecs_service" "phpbb" {
   name            = "phpbb"
   cluster         = aws_ecs_cluster.phpbb.id
   task_definition = aws_ecs_task_definition.phpbb.arn
   desired_count   = 1
+  enable_execute_command = true
   launch_type     = "FARGATE"
 
   network_configuration {
@@ -438,26 +411,19 @@ resource "aws_ecs_service" "phpbb" {
     container_port   = 80
   }
 
-  # Route53 record is updated by external-dns reading ALB DNS name
-  # No Helm controller needed - wire external-dns as a separate ECS
-  # service or Lambda if you need automatic DNS updates, or manage
-  # the Route53 record directly in Terraform (recommended at this scale).
-
   depends_on = [aws_lb_listener.https]
 }
 
-# -------------------------------------------------------
-# ROUTE53 - manage directly in Terraform instead of
-# external-dns, since you only have one ALB and one record.
-# This is simpler and removes the external-dns dependency.
-# -------------------------------------------------------
+
+# ROUTE53 
+
 data "aws_route53_zone" "main" {
   zone_id = var.route53_zone_id
 }
 
 resource "aws_route53_record" "phpbb" {
   zone_id = data.aws_route53_zone.main.zone_id
-  name    = forum.thegradyproject.com
+  name    = var.subdomain
   type    = "A"
 
   alias {
