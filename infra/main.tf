@@ -5,8 +5,6 @@ provider "aws" {
 locals {
   subnet_ids = [
     "subnet-048916d83b3d6dcf1",
-    "subnet-07e4939eae8fcd6bb",
-    "subnet-04181d7c9e2cc0f09",
   ]
 }
 
@@ -32,10 +30,8 @@ resource "aws_efs_file_system" "phpbb" {
 }
 
 resource "aws_efs_mount_target" "phpbb" {
-  for_each = toset(local.subnet_ids)
-
   file_system_id  = aws_efs_file_system.phpbb.id
-  subnet_id       = each.value
+  subnet_id       = local.subnet_ids[0]
   security_groups = [aws_security_group.efs.id]
 }
 
@@ -57,44 +53,19 @@ resource "aws_efs_access_point" "phpbb" {
   }
 }
 
-# SECURITY GROUPS
-resource "aws_security_group" "alb" {
-  name        = "phpbb-alb-sg"
-  description = "Allow HTTP/HTTPS inbound to ALB"
+
+
+resource "aws_security_group" "ecs_task" {
+  name        = "phpbb-ecs-task-sg"
+  description = "Allow inbound HTTP from CloudFront only"
   vpc_id      = var.vpc_id
 
   ingress {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-}
-
-resource "aws_security_group" "ecs_task" {
-  name        = "phpbb-ecs-task-sg"
-  description = "Allow inbound from ALB only"
-  vpc_id      = var.vpc_id
-
-  ingress {
-    from_port       = 80
-    to_port         = 80
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
+    # CloudFront managed prefix list - only allows CloudFront IPs
+    prefix_list_ids = [data.aws_ec2_managed_prefix_list.cloudfront.id]
   }
 
   egress {
@@ -125,45 +96,6 @@ resource "aws_security_group" "efs" {
   }
 }
 
-# ALB
-resource "aws_lb" "phpbb" {
-  name               = "phpbb-alb"
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = local.subnet_ids
-}
-
-resource "aws_lb_target_group" "phpbb" {
-  name        = "phpbb-tg"
-  port        = 80
-  protocol    = "HTTP"
-  vpc_id      = var.vpc_id
-  target_type = "ip" # required for Fargate
-
-  health_check {
-    path                = "/index.php"
-    healthy_threshold   = 2
-    unhealthy_threshold = 3
-    interval            = 30
-  }
-}
-
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.phpbb.arn
-  port              = 80
-  protocol          = "HTTP"
-
-  # Redirect HTTP to HTTPS
-  default_action {
-    type = "redirect"
-    redirect {
-      port        = "443"
-      protocol    = "HTTPS"
-      status_code = "HTTP_301"
-    }
-  }
-}
 
 data "terraform_remote_state" "statics" { # importing outputs from other folder
   backend = "local"
@@ -171,21 +103,7 @@ data "terraform_remote_state" "statics" { # importing outputs from other folder
     path = "../statics/terraform.tfstate"
   }
 }
-resource "aws_lb_listener" "https" {
-  load_balancer_arn = aws_lb.phpbb.arn
-  port              = 443
-  protocol          = "HTTPS"
-  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
-  certificate_arn = data.terraform_remote_state.statics.outputs.aws_acm_certificate # pass in from statics output
 
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.phpbb.arn
-  }
-}
-
-# IAM - ECS TASK EXECUTION ROLE
-# (pulls image from ECR, writes logs to CloudWatch)
 resource "aws_iam_role" "ecs_execution" {
   name = "phpbb-ecs-execution-role"
 
@@ -253,43 +171,6 @@ resource "aws_iam_role_policy_attachment" "phpbb_s3_attach" {
   policy_arn = aws_iam_policy.phpbb_s3_policy.arn
 }
 
-# IAM - EXTERNAL DNS ROLE
-resource "aws_iam_role" "externaldns" {
-  name = "external-dns"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "ecs-tasks.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
-}
-
-data "aws_iam_policy_document" "externaldns" {
-  statement {
-    effect  = "Allow"
-    actions = ["route53:ChangeResourceRecordSets", "route53:GetHostedZone"]
-    resources = ["arn:aws:route53:::hostedzone/${var.route53_zone_id}"]
-  }
-
-  statement {
-    effect  = "Allow"
-    actions = ["route53:ListHostedZones", "route53:ListResourceRecordSets"]
-    resources = ["*"]
-  }
-}
-
-resource "aws_iam_policy" "externaldns" {
-  name   = "ExternalDNSPolicy"
-  policy = data.aws_iam_policy_document.externaldns.json
-}
-
-resource "aws_iam_role_policy_attachment" "externaldns" {
-  role       = aws_iam_role.externaldns.name
-  policy_arn = aws_iam_policy.externaldns.arn
-}
 
 # CLOUDWATCH LOG GROUP
 resource "aws_cloudwatch_log_group" "phpbb" {
@@ -321,6 +202,11 @@ resource "aws_iam_role_policy_attachment" "secrets_attach" {
   policy_arn = aws_iam_policy.secrets_policy.arn
 }
 
+# SECRET FOR CLOUDFRONT
+
+data "aws_secretsmanager_secret_version" "cloudfront_secret" {
+    secret_id = "phpbb/cloudfront-secret"
+  }
 
 
 
@@ -398,20 +284,17 @@ resource "aws_ecs_service" "phpbb" {
   desired_count   = 1
   enable_execute_command = true
   launch_type     = "FARGATE"
+  depends_on = [
+    aws_lambda_permission.eventbridge,
+    aws_cloudwatch_event_target.lambda
+  ]
+}
 
   network_configuration {
     subnets          = local.subnet_ids
     security_groups  = [aws_security_group.ecs_task.id]
     assign_public_ip = true
   }
-
-  load_balancer {
-    target_group_arn = aws_lb_target_group.phpbb.arn
-    container_name   = "phpbb"
-    container_port   = 80
-  }
-
-  depends_on = [aws_lb_listener.https]
 }
 
 
@@ -421,14 +304,219 @@ data "aws_route53_zone" "main" {
   zone_id = var.route53_zone_id
 }
 
+data "aws_ec2_managed_prefix_list" "cloudfront" {
+  name = "com.amazonaws.global.cloudfront.origin-facing"
+}
+
+# CLOUDFRONT DISTRIBUTION
+
+resource "aws_cloudfront_distribution" "phpbb" {
+  enabled             = true
+  comment             = "phpBB forum distribution"
+  default_root_object = "index.php"
+
+  # Origin points at ECS task - Lambda keeps this updated
+  origin {
+    domain_name = "placeholder.example.com" # Lambda will update this
+    origin_id   = "phpbb-ecs-origin"
+
+    custom_origin_config {
+      http_port              = 80
+      https_port             = 443
+      origin_protocol_policy = "http-only" # HTTP internally is fine
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
+
+    # Custom header so your container can verify traffic came from CloudFront
+    custom_header {
+      name  = "X-CloudFront-Secret"
+      value = data.aws_secretsmanager_secret_version.cloudfront_secret.secret_string
+    }
+  }
+
+  default_cache_behavior {
+    allowed_methods        = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "phpbb-ecs-origin"
+    viewer_protocol_policy = "redirect-to-https"
+    compress               = true
+
+    # phpBB is dynamic - don't cache by default
+    forwarded_values {
+      query_string = true
+      cookies {
+        forward = "all"
+      }
+      headers = ["Host", "Authorization"]
+    }
+
+    min_ttl     = 0
+    default_ttl = 0
+    max_ttl     = 0
+  }
+
+  # Cache static assets (CSS, JS, images)
+  ordered_cache_behavior {
+    path_pattern           = "/assets/*"
+    allowed_methods        = ["GET", "HEAD"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "phpbb-ecs-origin"
+    viewer_protocol_policy = "redirect-to-https"
+    compress               = true
+
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+
+    min_ttl     = 86400
+    default_ttl = 86400
+    max_ttl     = 31536000
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    acm_certificate_arn      = data.terraform_remote_state.statics.outputs.aws_acm_certificate
+    ssl_support_method       = "sni-only"
+    minimum_protocol_version = "TLSv1.2_2021"
+  }
+
+  aliases = [var.subdomain] # e.g. forum.thegradyproject.com
+
+  tags = {
+    Environment = "prod"
+    Terraform   = "true"
+  }
+}
+
+# IAM - LAMBDA EXECUTION ROLE
+
+resource "aws_iam_role" "lambda_origin_updater" {
+  name = "phpbb-lambda-origin-updater"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+data "aws_iam_policy_document" "lambda_origin_updater" {
+  # CloudWatch logs
+  statement {
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents"
+    ]
+    resources = ["arn:aws:logs:*:*:*"]
+  }
+
+  # Describe ECS tasks to get the IP
+  statement {
+    effect = "Allow"
+    actions = [
+      "ecs:DescribeTasks",
+      "ec2:DescribeNetworkInterfaces"
+    ]
+    resources = ["*"]
+  }
+
+  # Update CloudFront distribution origin
+  statement {
+    effect = "Allow"
+    actions = [
+      "cloudfront:GetDistributionConfig",
+      "cloudfront:UpdateDistribution"
+    ]
+    resources = [aws_cloudfront_distribution.phpbb.arn]
+  }
+}
+
+resource "aws_iam_policy" "lambda_origin_updater" {
+  name   = "phpbb-lambda-origin-updater-policy"
+  policy = data.aws_iam_policy_document.lambda_origin_updater.json
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_origin_updater" {
+  role       = aws_iam_role.lambda_origin_updater.name
+  policy_arn = aws_iam_policy.lambda_origin_updater.arn
+}
+
+# LAMBDA FUNCTION
+
+resource "aws_lambda_function" "origin_updater" {
+  filename         = "${path.module}/lambda/origin_updater.zip"
+  function_name    = "phpbb-origin-updater"
+  role             = aws_iam_role.lambda_origin_updater.arn
+  handler          = "origin_updater.handler"
+  runtime          = "python3.12"
+  timeout          = 30
+  source_code_hash = filebase64sha256("${path.module}/lambda/origin_updater.zip")
+  environment {
+    variables = {
+      DISTRIBUTION_ID = aws_cloudfront_distribution.phpbb.id
+      CLUSTER_NAME    = var.cluster_name
+    }
+  }
+}
+
+
+# EVENTBRIDGE RULE
+# Fires when ECS task transitions to RUNNING
+
+resource "aws_cloudwatch_event_rule" "ecs_task_running" {
+  name        = "phpbb-ecs-task-running"
+  description = "Fires when phpBB ECS task reaches RUNNING state"
+
+  event_pattern = jsonencode({
+    source      = ["aws.ecs"]
+    detail-type = ["ECS Task State Change"]
+    detail = {
+      clusterArn    = [aws_ecs_cluster.phpbb.arn]
+      lastStatus    = ["RUNNING"]
+      desiredStatus = ["RUNNING"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "lambda" {
+  rule      = aws_cloudwatch_event_rule.ecs_task_running.name
+  target_id = "phpbb-origin-updater"
+  arn       = aws_lambda_function.origin_updater.arn
+}
+
+resource "aws_lambda_permission" "eventbridge" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.origin_updater.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.ecs_task_running.arn
+}
+
+# ROUTE53 - point at CloudFront instead of ALB
+
 resource "aws_route53_record" "phpbb" {
   zone_id = data.aws_route53_zone.main.zone_id
   name    = var.subdomain
   type    = "A"
 
   alias {
-    name                   = aws_lb.phpbb.dns_name
-    zone_id                = aws_lb.phpbb.zone_id
-    evaluate_target_health = true
+    name                   = aws_cloudfront_distribution.phpbb.domain_name
+    zone_id                = aws_cloudfront_distribution.phpbb.hosted_zone_id
+    evaluate_target_health = false
   }
+
+  allow_overwrite = true
 }
