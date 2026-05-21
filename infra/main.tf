@@ -188,7 +188,10 @@ data "aws_iam_policy_document" "secrets_access" {
   statement {
     effect    = "Allow"
     actions   = ["secretsmanager:GetSecretValue"]
-    resources = [data.aws_secretsmanager_secret.phpbb_config.arn]
+    resources = [
+      data.aws_secretsmanager_secret.phpbb_config.arn,
+      data.aws_secretsmanager_secret_version.dt_paas_token.arn
+    ]
   }
 }
 
@@ -208,10 +211,13 @@ data "aws_secretsmanager_secret_version" "cloudfront_secret" {
     secret_id = "phpbb/cloudfront-secret"
   }
 
+# DYNATRACE SECRET
 
+data "aws_secretsmanager_secret_version" "dt_paas_token" {
+  secret_id = "phpbb/dt-paas-token"
+}
 
 # ECS TASK DEFINITION
-
 resource "aws_iam_role_policy_attachment" "ecs_task_ssm" {
   role       = aws_iam_role.ecs_task.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
@@ -222,10 +228,11 @@ resource "aws_ecs_task_definition" "phpbb" {
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
   cpu                      = 512
-  memory                   = 1024
+  memory                   = 2048
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
 
+  # EFS volume for phpBB media
   volume {
     name = "phpbb-efs"
     efs_volume_configuration {
@@ -238,7 +245,54 @@ resource "aws_ecs_task_definition" "phpbb" {
     }
   }
 
+  # Shared bind mount for Dynatrace OneAgent
+  volume {
+    name = "oneagent"
+  }
+
   container_definitions = jsonencode([
+    # Init container - downloads and unzips OneAgent into shared volume
+    {
+      name      = "install-oneagent"
+      image     = "alpine:3"
+      essential = false
+
+      memory    = 128
+
+      entryPoint = ["/bin/sh", "-c"]
+      command = ["apk add --no-cache wget unzip && ARCHIVE=$(mktemp) && wget -O $ARCHIVE \"$DT_API_URL/v1/deployment/installer/agent/unix/paas/latest?arch=$ARCH&Api-Token=$DT_PAAS_TOKEN&$DT_ONEAGENT_OPTIONS\" && unzip -o -d /opt/dynatrace/oneagent $ARCHIVE && rm -f $ARCHIVE"]
+      environment = [
+        { name = "DT_API_URL",          value = "https://vdz04711.live.dynatrace.com/api" },
+        { name = "DT_ONEAGENT_OPTIONS", value = "flavor=default&include=all" },
+        { name = "ARCH",                value = "x86" }
+      ]
+
+      secrets = [
+        {
+          name      = "DT_PAAS_TOKEN"
+          valueFrom = data.aws_secretsmanager_secret_version.dt_paas_token.arn
+        }
+      ]
+
+      mountPoints = [
+        {
+          sourceVolume  = "oneagent"
+          containerPath = "/opt/dynatrace/oneagent"
+          readOnly      = false
+        }
+      ]
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          awslogs-group         = aws_cloudwatch_log_group.phpbb.name
+          awslogs-region        = var.aws_region
+          awslogs-stream-prefix = "install-oneagent"
+        }
+      }
+    },
+
+    # phpBB application container
     {
       name      = "phpbb"
       image     = var.app_image
@@ -248,20 +302,39 @@ resource "aws_ecs_task_definition" "phpbb" {
         { containerPort = 80, protocol = "tcp" }
       ]
 
-      # EFS mounted at /mnt/phpbb-s3 
       mountPoints = [
         {
           sourceVolume  = "phpbb-efs"
           containerPath = "/mnt/phpbb-s3"
           readOnly      = false
+        },
+        {
+          sourceVolume  = "oneagent"
+          containerPath = "/opt/dynatrace/oneagent"
+          readOnly      = true
         }
       ]
+
+      # Dynatrace runtime injection
+      environment = [
+        { name = "LD_PRELOAD", value = "/opt/dynatrace/oneagent/agent/lib64/liboneagentproc.so" }
+      ]
+
+      # Wait for OneAgent to be installed before starting
+      dependsOn = [
+        {
+          containerName = "install-oneagent"
+          condition     = "COMPLETE"
+        }
+      ]
+
       secrets = [
         {
           name      = "PHPBB_CONFIG"
           valueFrom = data.aws_secretsmanager_secret.phpbb_config.arn
         }
       ]
+
       logConfiguration = {
         logDriver = "awslogs"
         options = {
@@ -273,7 +346,6 @@ resource "aws_ecs_task_definition" "phpbb" {
     }
   ])
 }
-
 
 # ECS SERVICE
 
@@ -288,7 +360,6 @@ resource "aws_ecs_service" "phpbb" {
     aws_lambda_permission.eventbridge,
     aws_cloudwatch_event_target.lambda
   ]
-}
 
   network_configuration {
     subnets          = local.subnet_ids
