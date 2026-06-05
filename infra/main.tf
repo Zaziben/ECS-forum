@@ -404,7 +404,26 @@ resource "aws_cloudfront_distribution" "phpbb" {
       value = data.aws_secretsmanager_secret_version.cloudfront_secret.secret_string
     }
   }
+  # Cache for oneagent injection
+  ordered_cache_behavior {
+    path_pattern           = "/ruxitagentjs_*"
+    allowed_methods        = ["GET", "HEAD"]
+    cached_methods         = ["GET", "HEAD"]
+    target_origin_id       = "phpbb-ecs-origin"
+    viewer_protocol_policy = "redirect-to-https"
+    compress               = true
 
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+
+    min_ttl     = 0
+    default_ttl = 3600
+    max_ttl     = 86400
+  }
   default_cache_behavior {
     allowed_methods        = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
     cached_methods         = ["GET", "HEAD"]
@@ -576,7 +595,7 @@ resource "aws_lambda_permission" "eventbridge" {
   source_arn    = aws_cloudwatch_event_rule.ecs_task_running.arn
 }
 
-# ROUTE53 - point at CloudFront instead of ALB
+# ROUTE53 - point at cloudfront
 
 resource "aws_route53_record" "phpbb" {
   zone_id = data.aws_route53_zone.main.zone_id
